@@ -1,0 +1,6 @@
+{
+  "name": "Aegis: The Last-Minute Life Saver",
+  "description": "An autonomous agentic prioritization and dynamic recovery assistant that programmatically calculates task urgency, triggers rescue operations, and logs real-time agent interventions.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
