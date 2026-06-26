@@ -5,10 +5,33 @@ import { GoogleGenAI } from '@google/genai';
 let isRunning = false;
 let intervalId: NodeJS.Timeout | null = null;
 
+let isQuotaLimited = false;
+let quotaResetTime = 0;
+
+function checkQuotaStatus(): boolean {
+  if (isQuotaLimited) {
+    if (Date.now() > quotaResetTime) {
+      isQuotaLimited = false;
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function flagQuota() {
+  isQuotaLimited = true;
+  quotaResetTime = Date.now() + 180000; // 3 min cooloff
+}
+
+function isQuotaError(err: any): boolean {
+  if (!err) return false;
+  const msg = String(err.message || err.status || (err.error && err.error.message) || JSON.stringify(err)).toLowerCase();
+  return msg.includes('429') || msg.includes('quota') || msg.includes('limit') || msg.includes('exhausted');
+}
+
 async function generateRescueAction(task: any): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.trim() === '') {
-    return `[Aegis Autonomous Recovery Service]
+  const defaultPlan = `[Aegis Autonomous Recovery Service]
 Subject: EXTREME URGENCY: Assistance Required / Request for Extension on "${task.title}"
 
 Dear Team,
@@ -24,6 +47,16 @@ Thank you for your immediate coordination.
 
 Best regards,
 Aegis Dynamic Recovery Agent`;
+
+  // Check if we are currently flagged as rate-limited
+  if (checkQuotaStatus()) {
+    console.warn(`[Aegis Engine] Gemini API rate limit active. Generating local high-fidelity mitigation plan for "${task.title}".`);
+    return defaultPlan;
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.trim() === '') {
+    return defaultPlan;
   }
 
   const ai = new GoogleGenAI({
@@ -55,20 +88,33 @@ Start directly with the plan title, formatted clearly in plain text. Keep the to
       return response.text;
     }
   } catch (err: any) {
-    console.warn('[Aegis Engine] Failed primary plan generation via gemini-3.5-flash:', err.message || err);
+    if (isQuotaError(err)) {
+      flagQuota();
+      console.warn('[Aegis Engine] Gemini API Quota exceeded. Activating local rescue planner.');
+      return defaultPlan;
+    } else {
+      console.warn('[Aegis Engine] Failed primary plan generation via gemini-3.5-flash:', err.message || err);
+    }
   }
 
-  // Fallback model gemini-3.1-flash-lite if primary is overloaded (503) or unavailable
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
-      contents: prompt,
-    });
-    if (response && response.text) {
-      return response.text;
+  // Fallback model gemini-3.1-flash-lite if primary is overloaded or unavailable and we aren't rate limited
+  if (!isQuotaLimited) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-3.1-flash-lite",
+        contents: prompt,
+      });
+      if (response && response.text) {
+        return response.text;
+      }
+    } catch (err: any) {
+      if (isQuotaError(err)) {
+        flagQuota();
+        console.warn('[Aegis Engine] Gemini API Quota exceeded on fallback.');
+      } else {
+        console.error('[Aegis Engine] Failed fallback plan generation via gemini-3.1-flash-lite:', err.message || err);
+      }
     }
-  } catch (err: any) {
-    console.error('[Aegis Engine] Failed fallback plan generation via gemini-3.1-flash-lite:', err.message || err);
   }
 
   // Ultimate static rescue fallback

@@ -15,7 +15,36 @@ const cache = {
     fingerprint: ''
   }
 };
-const COOLDOWN_MS = 45000; // 45 seconds cooldown between real LLM generations
+
+// Cooldown between real LLM generations (45 seconds)
+const COOLDOWN_MS = 45000;
+
+// Track if we are rate limited globally to avoid redundant heavy calls
+let isGloballyRateLimited = false;
+let rateLimitResetTime = 0;
+
+function checkRateLimitStatus(): boolean {
+  if (isGloballyRateLimited) {
+    if (Date.now() > rateLimitResetTime) {
+      isGloballyRateLimited = false;
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function flagRateLimit() {
+  isGloballyRateLimited = true;
+  // Hold rate-limit bypass for 3 minutes
+  rateLimitResetTime = Date.now() + 180000;
+}
+
+function isQuotaError(err: any): boolean {
+  if (!err) return false;
+  const msg = String(err.message || err.status || (err.error && err.error.message) || JSON.stringify(err)).toLowerCase();
+  return msg.includes('429') || msg.includes('quota') || msg.includes('limit') || msg.includes('exhausted');
+}
 
 export const RecommendationController = {
   async getRecommendations(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -39,18 +68,27 @@ export const RecommendationController = {
 
       // Check cache validity (fingerprint matches and cooldown is active)
       if (cache.recommendations.fingerprint === fingerprint && (now - cache.recommendations.timestamp) < COOLDOWN_MS) {
-        console.log('[Aegis Recommendations] Serving from cache (Fingerprint match & Cooldown active)');
         res.json({ recommendations: cache.recommendations.data });
         return;
       }
 
       // General throttle: if we made a real API call less than 15 seconds ago, reuse cache/static to avoid rate spikes
       if (cache.recommendations.timestamp > 0 && (now - cache.recommendations.timestamp) < 15000) {
-        console.log('[Aegis Recommendations] Serving from cache (General throttle 15s)');
         res.json({ 
           recommendations: cache.recommendations.data.length > 0 
             ? cache.recommendations.data 
             : generateStaticRecommendations(pendingTasks) 
+        });
+        return;
+      }
+
+      // Check if we already detected a rate limit globally
+      if (checkRateLimitStatus()) {
+        console.warn('[Aegis Recommendations] Rate limit active. Using static fallback engine.');
+        res.json({
+          recommendations: cache.recommendations.data.length > 0 
+            ? cache.recommendations.data 
+            : generateStaticRecommendations(pendingTasks)
         });
         return;
       }
@@ -107,33 +145,45 @@ Format instructions:
           }
         }
       } catch (err: any) {
-        console.warn('[Aegis Recommendations] Primary model failed, attempting fallback...', err.message || err);
+        if (isQuotaError(err)) {
+          flagRateLimit();
+          console.warn('[Aegis Recommendations] Gemini API Quota exceeded. Activating static recommendations engine.');
+        } else {
+          console.warn('[Aegis Recommendations] Primary model failed, attempting fallback...', err.message || err);
+        }
       }
 
-      // Try fallback model
-      try {
-        const response = await ai.models.generateContent({
-          model: "gemini-3.1-flash-lite",
-          contents: prompt,
-        });
+      // Try fallback model if not rate limited
+      if (!isGloballyRateLimited) {
+        try {
+          const response = await ai.models.generateContent({
+            model: "gemini-3.1-flash-lite",
+            contents: prompt,
+          });
 
-        if (response && response.text) {
-          const lines = response.text
-            .split('\n')
-            .map(l => l.trim())
-            .filter(l => l.startsWith('-') || l.startsWith('*') || l.match(/^\d+\./))
-            .map(l => l.replace(/^[-*\d.]+\s*/, ''));
-          
-          if (lines.length >= 3) {
-            cache.recommendations.data = lines.slice(0, 3);
-            cache.recommendations.timestamp = Date.now();
-            cache.recommendations.fingerprint = fingerprint;
-            res.json({ recommendations: cache.recommendations.data });
-            return;
+          if (response && response.text) {
+            const lines = response.text
+              .split('\n')
+              .map(l => l.trim())
+              .filter(l => l.startsWith('-') || l.startsWith('*') || l.match(/^\d+\./))
+              .map(l => l.replace(/^[-*\d.]+\s*/, ''));
+            
+            if (lines.length >= 3) {
+              cache.recommendations.data = lines.slice(0, 3);
+              cache.recommendations.timestamp = Date.now();
+              cache.recommendations.fingerprint = fingerprint;
+              res.json({ recommendations: cache.recommendations.data });
+              return;
+            }
+          }
+        } catch (err: any) {
+          if (isQuotaError(err)) {
+            flagRateLimit();
+            console.warn('[Aegis Recommendations] Gemini API Quota exceeded on fallback.');
+          } else {
+            console.error('[Aegis Recommendations] Fallback model failed too.', err.message || err);
           }
         }
-      } catch (err: any) {
-        console.error('[Aegis Recommendations] Fallback model failed too.', err.message || err);
       }
 
       // If we failed all LLM requests, return cached value if we have any, or fall back to static
@@ -166,18 +216,27 @@ Format instructions:
 
       // Check cache validity (fingerprint matches and cooldown is active)
       if (cache.schedule.fingerprint === fingerprint && (now - cache.schedule.timestamp) < COOLDOWN_MS) {
-        console.log('[Aegis Schedule] Serving from cache (Fingerprint match & Cooldown active)');
         res.json({ schedule: cache.schedule.data });
         return;
       }
 
       // General throttle: if we made a real API call less than 15 seconds ago, reuse cache/static to avoid rate spikes
       if (cache.schedule.timestamp > 0 && (now - cache.schedule.timestamp) < 15000) {
-        console.log('[Aegis Schedule] Serving from cache (General throttle 15s)');
         res.json({ 
           schedule: cache.schedule.data.length > 0 
             ? cache.schedule.data 
             : generateStaticSchedule(pendingTasks) 
+        });
+        return;
+      }
+
+      // Check if we already detected a rate limit globally
+      if (checkRateLimitStatus()) {
+        console.warn('[Aegis Schedule] Rate limit active. Using static fallback schedule.');
+        res.json({
+          schedule: cache.schedule.data.length > 0 
+            ? cache.schedule.data 
+            : generateStaticSchedule(pendingTasks)
         });
         return;
       }
@@ -233,29 +292,41 @@ Return ONLY raw JSON, with no markdown backticks, no prefix, and no conversation
           }
         }
       } catch (err: any) {
-        console.warn('[Aegis Schedule] Primary model failed, trying fallback...', err.message || err);
+        if (isQuotaError(err)) {
+          flagRateLimit();
+          console.warn('[Aegis Schedule] Gemini API Quota exceeded. Activating static schedule engine.');
+        } else {
+          console.warn('[Aegis Schedule] Primary model failed, trying fallback...', err.message || err);
+        }
       }
 
-      // Try fallback model
-      try {
-        const response = await ai.models.generateContent({
-          model: "gemini-3.1-flash-lite",
-          contents: prompt,
-        });
+      // Try fallback model if not rate limited
+      if (!isGloballyRateLimited) {
+        try {
+          const response = await ai.models.generateContent({
+            model: "gemini-3.1-flash-lite",
+            contents: prompt,
+          });
 
-        if (response && response.text) {
-          const rawText = response.text.replace(/```json|```/g, '').trim();
-          const parsed = JSON.parse(rawText);
-          if (Array.isArray(parsed)) {
-            cache.schedule.data = parsed.slice(0, 4);
-            cache.schedule.timestamp = Date.now();
-            cache.schedule.fingerprint = fingerprint;
-            res.json({ schedule: cache.schedule.data });
-            return;
+          if (response && response.text) {
+            const rawText = response.text.replace(/```json|```/g, '').trim();
+            const parsed = JSON.parse(rawText);
+            if (Array.isArray(parsed)) {
+              cache.schedule.data = parsed.slice(0, 4);
+              cache.schedule.timestamp = Date.now();
+              cache.schedule.fingerprint = fingerprint;
+              res.json({ schedule: cache.schedule.data });
+              return;
+            }
+          }
+        } catch (err: any) {
+          if (isQuotaError(err)) {
+            flagRateLimit();
+            console.warn('[Aegis Schedule] Gemini API Quota exceeded on fallback.');
+          } else {
+            console.error('[Aegis Schedule] Fallback model failed too.', err.message || err);
           }
         }
-      } catch (err: any) {
-        console.error('[Aegis Schedule] Fallback model failed too.', err.message || err);
       }
 
       // Fallback
